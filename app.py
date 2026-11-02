@@ -107,7 +107,7 @@ def save_favorites(favs: list[dict]) -> None:
 
 class FavoriteIn(BaseModel):
     volume: str
-    page: int
+    pages: list[int]  # one page, or both pages of a two-page spread
 
 
 # --- routes ------------------------------------------------------------------
@@ -182,12 +182,15 @@ def favorites():
 
 @app.post("/api/favorites/toggle")
 def toggle_favorite(f: FavoriteIn):
-    check_page(f.volume, f.page)
+    if not 1 <= len(f.pages) <= 2:
+        raise HTTPException(422, "a favorite is one page or a two-page spread")
+    for p in f.pages:
+        check_page(f.volume, p)
     with _fav_lock:
         favs = load_favorites()
-        kept = [x for x in favs if not (x["volume"] == f.volume and x["page"] == f.page)]
+        kept = [x for x in favs if not (x["volume"] == f.volume and x["pages"] == f.pages)]
         favorited = len(kept) == len(favs)
         if favorited:
-            kept.append({"volume": f.volume, "page": f.page, "added": int(time.time())})
+            kept.append({"volume": f.volume, "pages": f.pages, "added": int(time.time())})
         save_favorites(kept)
     return {"favorited": favorited}
