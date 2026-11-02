@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Manga</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #111; color: #ddd; font: 15px/1.4 system-ui, sans-serif; }
+  a { color: inherit; text-decoration: none; }
+  nav { display: flex; gap: 16px; padding: 10px 16px; background: #1a1a1a; }
+  nav a.on { color: #fff; font-weight: 600; }
+  main { padding: 16px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+  .vol { padding: 12px; background: #1c1c1c; border-radius: 6px; }
+  .vol:hover { background: #262626; }
+  .vol small { color: #888; display: block; }
+  .continue { display: inline-block; margin-bottom: 16px; padding: 8px 12px; background: #2a2a2a; border-radius: 6px; }
+  .fav img { width: 100%; display: block; border-radius: 4px; }
+  .fav small { color: #888; }
+  #reader { position: fixed; inset: 0; background: #000; display: flex; align-items: center; justify-content: center; }
+  /* row-reverse: manga reads right to left, so the first page of a spread sits on the right */
+  #pages { display: flex; flex-direction: row-reverse; }
+  #pages img { max-height: 100vh; max-width: 100vw; user-select: none; display: block; }
+  #pages.two img { max-width: 50vw; }
+  #reader.width { overflow-y: auto; align-items: flex-start; }
+  #reader.width img { max-height: none; width: min(100vw, 1000px); }
+  #reader.width .two img { width: 50vw; }
+  #pos { position: fixed; top: 8px; left: 8px; background: #000a; padding: 4px 10px; border-radius: 6px; font-size: 13px; }
+  #hud { position: fixed; bottom: 8px; left: 50%; transform: translateX(-50%); background: #000a; padding: 4px 10px;
+         border-radius: 6px; font-size: 13px; display: flex; gap: 12px; align-items: center; white-space: nowrap; }
+  #stars { display: flex; flex-direction: row-reverse; gap: 8px; }
+  #hud button { background: none; border: 0; color: #888; font-size: 18px; cursor: pointer; padding: 0; }
+  #hud button.on { color: gold; }
+  #hud label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+  #toast { position: fixed; top: 16px; left: 50%; transform: translateX(-50%); background: #000c; padding: 6px 14px;
+           border-radius: 6px; opacity: 0; transition: opacity .3s; pointer-events: none; }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="toast"></div>
+<script>
+const app = document.getElementById('app');
+let volumes = [];
+let favs = new Set();           // "volume|page"
+const favKey = (v, p) => v + '|' + p;
+const enc = encodeURIComponent;
+const opt = k => localStorage.getItem(k) === '1';
+const setOpt = (k, on) => localStorage.setItem(k, on ? '1' : '0');
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(t.timer);
+  t.timer = setTimeout(() => t.classList.remove('show'), 900);
+}
+
+function nav(active) {
+  return `<nav><a href="#/" class="${active === 'lib' ? 'on' : ''}">Library</a>
+              <a href="#/favorites" class="${active === 'fav' ? 'on' : ''}">Favorites (${favs.size})</a></nav>`;
+}
+
+function getLast() {
+  try { return JSON.parse(localStorage.getItem('last')); } catch { return null; }
+}
+
+function showLibrary() {
+  const last = getLast();
+  const lastVol = last && volumes.find(v => v.id === last.volume);
+  app.innerHTML = nav('lib') + `<main>
+    ${lastVol ? `<a class="continue" href="#/read/${enc(lastVol.id)}/${last.page}">Continue: ${lastVol.title}, page ${last.page + 1}</a>` : ''}
+    <div class="grid">${volumes.map(v =>
+      `<a class="vol" href="#/read/${enc(v.id)}/0">${v.title}<small>${v.pages} pages</small></a>`).join('')}
+    </div></main>`;
+}
+
+async function showFavorites() {
+  const list = await (await fetch('/api/favorites')).json();
+  list.sort((a, b) => b.added - a.added);
+  const title = id => (volumes.find(v => v.id === id) || {}).title || id;
+  app.innerHTML = nav('fav') + `<main>${list.length ? '' : '<p>No favorites yet. Press <b>f</b> while reading.</p>'}
+    <div class="grid">${list.map(f =>
+      `<a class="fav" href="#/read/${enc(f.volume)}/${f.page}">
+         <img loading="lazy" src="/api/thumb/${enc(f.volume)}/${f.page}">
+         <small>${title(f.volume)}, p. ${f.page + 1}</small></a>`).join('')}
+    </div></main>`;
+}
+
+// --- page sizes & spreads ------------------------------------------------------
+
+const sizes = {};  // volume id -> [[w, h], ...]
+
+async function getSizes(vid) {
+  if (!sizes[vid]) sizes[vid] = await (await fetch(`/api/sizes/${enc(vid)}`)).json();
+  return sizes[vid];
+}
+
+// Groups a volume's pages into what's shown at once: [[0], [1, 2], [3], ...].
+// The cover and wide (double-page) images are always shown alone.
+// "shift" makes page 1 single too, for scans whose pairs come out off by one.
+function spreadsFor(vid) {
+  const dims = sizes[vid];
+  if (!opt('spread')) return dims.map((_, i) => [i]);
+  const wide = i => dims[i][0] > dims[i][1];
+  const alone = new Set(opt('shift') ? [0, 1] : [0]);
+  const out = [];
+  for (let i = 0; i < dims.length;) {
+    if (alone.has(i) || wide(i) || i + 1 >= dims.length || wide(i + 1)) out.push([i++]);
+    else { out.push([i, i + 1]); i += 2; }
+  }
+  return out;
+}
+
+// --- reader ----------------------------------------------------------------------
+
+let reader = null;  // { vi, page } where page is the first page of the current spread
+
+async function showReader(vid, page) {
+  const vi = volumes.findIndex(v => v.id === vid);
+  if (vi < 0) return location.hash = '#/';
+  reader = { vi, page: Math.min(page, volumes[vi].pages - 1) };
+  app.innerHTML = `<div id="reader" class="${opt('fitWidth') ? 'width' : ''}"><div id="pages"></div></div>
+    <div id="pos"></div>
+    <div id="hud">
+      <span id="stars"></span>
+      <label title="Show two pages side by side"><input type="checkbox" id="spread" ${opt('spread') ? 'checked' : ''}> 2 pages</label>
+      <a href="#/" title="Back (Esc)">✕</a>
+    </div>`;
+  document.getElementById('reader').onclick = e => (e.clientX > innerWidth / 2 ? turn(1) : turn(-1));
+  document.getElementById('spread').onchange = e => {
+    setOpt('spread', e.target.checked);
+    e.target.blur();  // otherwise space (next page) would toggle the checkbox
+    render();
+  };
+  await getSizes(vid);
+  if (reader) render();
+}
+
+function currentSpread() {
+  const sp = spreadsFor(volumes[reader.vi].id);
+  return sp.find(s => s.includes(reader.page)) || sp[0];
+}
+
+function render() {
+  const v = volumes[reader.vi];
+  const src = p => `/api/page/${enc(v.id)}/${p}`;
+  const spread = currentSpread();
+  reader.page = spread[0];
+  const pages = document.getElementById('pages');
+  pages.className = spread.length === 2 ? 'two' : '';
+  pages.innerHTML = spread.map(p => `<img src="${src(p)}" alt="">`).join('');
+  document.getElementById('pos').textContent =
+    `${v.title} · ${spread.map(p => p + 1).join('–')} / ${v.pages}`;
+  renderStars();
+  document.getElementById('reader').scrollTop = 0;
+  const after = spread[spread.length - 1];
+  for (let p = after + 1; p <= after + 4 && p < v.pages; p++) new Image().src = src(p);
+  history.replaceState(null, '', `#/read/${enc(v.id)}/${reader.page}`);
+  localStorage.setItem('last', JSON.stringify({ volume: v.id, page: reader.page }));
+}
+
+function renderStars() {
+  const vid = volumes[reader.vi].id, spread = currentSpread();
+  const stars = document.getElementById('stars');
+  stars.innerHTML = spread.map((p, i) =>
+    `<button data-p="${p}" class="${favs.has(favKey(vid, p)) ? 'on' : ''}"
+             title="Favorite page ${p + 1} (${i ? 'Shift+F' : 'f'})">★${spread.length > 1 ? `<small>${p + 1}</small>` : ''}</button>`).join('');
+  stars.querySelectorAll('button').forEach(b => b.onclick = () => toggleFav(+b.dataset.p));
+}
+
+async function turn(d) {
+  let { vi } = reader;
+  const sp = spreadsFor(volumes[vi].id);
+  const si = sp.findIndex(s => s.includes(reader.page)) + d;
+  if (si >= sp.length) {
+    if (vi + 1 >= volumes.length) return toast('Last page');
+    vi++;
+    await getSizes(volumes[vi].id);
+    if (!reader) return;
+    reader = { vi, page: 0 };
+    toast(volumes[vi].title);
+  } else if (si < 0) {
+    if (vi === 0) return toast('First page');
+    vi--;
+    await getSizes(volumes[vi].id);
+    if (!reader) return;
+    reader = { vi, page: spreadsFor(volumes[vi].id).at(-1)[0] };
+    toast(volumes[vi].title);
+  } else {
+    reader = { vi, page: sp[si][0] };
+  }
+  render();
+}
+
+async function toggleFav(page) {
+  const volume = volumes[reader.vi].id;
+  const r = await fetch('/api/favorites/toggle', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ volume, page }),
+  });
+  const { favorited } = await r.json();
+  favorited ? favs.add(favKey(volume, page)) : favs.delete(favKey(volume, page));
+  toast(favorited ? `★ Favorited page ${page + 1}` : `Removed page ${page + 1} from favorites`);
+  if (reader) renderStars();
+}
+
+document.addEventListener('keydown', e => {
+  if (!reader || e.ctrlKey || e.metaKey || e.altKey) return;
+  const k = e.key, spread = currentSpread();
+  if (k === 'ArrowRight' || k === 'd' || k === ' ') { e.preventDefault(); turn(1); }
+  else if (k === 'ArrowLeft' || k === 'a') turn(-1);
+  else if (k === 'f') toggleFav(spread[0]);
+  else if (k === 'F' && spread[1] !== undefined) toggleFav(spread[1]);
+  else if (k === 'o' && opt('spread')) {
+    setOpt('shift', !opt('shift'));
+    toast('Page pairing shifted');
+    render();
+  }
+  else if (k === 'w') setOpt('fitWidth', document.getElementById('reader').classList.toggle('width'));
+  else if (k === 'Escape') location.hash = '#/';
+});
+
+function route() {
+  const h = location.hash.slice(1) || '/';
+  const m = h.match(/^\/read\/([^/]+)\/(\d+)$/);
+  if (m) {
+    const vid = decodeURIComponent(m[1]), page = +m[2];
+    // replaceState in render() doesn't fire hashchange, so this only runs on real navigation
+    if (!reader || volumes[reader.vi].id !== vid || reader.page !== page) showReader(vid, page);
+    return;
+  }
+  reader = null;
+  h === '/favorites' ? showFavorites() : showLibrary();
+}
+
+(async () => {
+  const [v, f] = await Promise.all([fetch('/api/volumes').then(r => r.json()), fetch('/api/favorites').then(r => r.json())]);
+  volumes = v;
+  favs = new Set(f.map(x => favKey(x.volume, x.page)));
+  addEventListener('hashchange', route);
+  route();
+})();
+</script>
+</body>
+</html>
